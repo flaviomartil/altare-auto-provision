@@ -47,13 +47,20 @@ Use single quotes around passwords containing spaces, `#`, or other special char
 
 ### Finding your configuration values
 
-1. Sign in to the [Altare console](https://console.altare.gg) and select your team.
-2. Open your browser's developer tools and select the **Network** tab.
-3. Choose a template and region in the creation form. When you make an authorized creation attempt, find the `POST /api/tenants/<uuid>/servers` request. If that request already created a server, check the console before running this program.
-4. The UUID in the request URL is `ALTARE_TENANT_ID`. The value after `Bearer ` in the `authorization` header is `ALTARE_TOKEN`.
-5. In the JSON request body, `eggId` identifies the template and `location` identifies the region. Copy only the needed values into your local `.env` file.
+Sign in to the [Altare console](https://console.altare.gg), select your team and open your browser's developer tools.
 
-Browser sessions can expire. This script uses the console API, whose contract may change. This is an unofficial integration and does not bypass the provider's authentication challenges.
+1. **`ALTARE_TOKEN`:** open **Application** (Chrome) or **Storage** (Firefox), then **Cookies** › `https://console.altare.gg`, and copy the value of the `altare_session` cookie. The cookie is HttpOnly, so a script in the page cannot read it. The `cf_clearance` cookie next to it is not needed.
+2. **`ALTARE_TENANT_ID`:** in the **Console** tab, run the following line. It copies the ID of the team currently selected in the console to the clipboard. Chrome asks you to type `allow pasting` before it accepts pasted code.
+
+   ```js
+   copy(localStorage.getItem('altare_selected_tenant_id'))
+   ```
+
+3. **`ALTARE_EGG_ID`** and **`ALTARE_LOCATION`:** run `--list-options` once the token and tenant ID are set. It does not need the other settings.
+
+If a setting is missing, the program prints these steps. The session expires after some time. The API then answers with HTTP 401, the program pauses and shows how to copy a new token. Update `ALTARE_TOKEN` and run `--resume`.
+
+This script uses the console API with a browser session, and that contract may change. Team API tokens (`alt_…`) do not work, because Altare does not allow them to create servers. This is an unofficial integration and does not bypass the provider's authentication challenges.
 
 After filling in the required values, inspect your options and resources without creating anything:
 
@@ -154,7 +161,7 @@ To run several requests side by side, give each one its own name and `ALTARE_STA
 
 ## Credentials and scope
 
-The `.env` file, default state directory, and logs are excluded through `.gitignore`. Keep tokens local. Do not publish your browser's “Copy as cURL” output, which often contains session credentials and cookies. Use the program with your own account and follow the provider's rules. Capacity and free-plan terms may change.
+The `.env` file, default state directory, and logs are excluded through `.gitignore`. Keep tokens local. Do not share the `altare_session` value or your browser's “Copy as cURL” output, which contains it. Use the program with your own account and follow the provider's rules. Capacity and free-plan terms may change.
 
 The program only queries the API and requests creation of one server. It does not delete servers, resize existing servers, or send messages or notifications.
 

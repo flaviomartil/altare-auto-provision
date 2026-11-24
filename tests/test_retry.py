@@ -70,8 +70,10 @@ class ProvisionTests(unittest.TestCase):
 
     def test_authentication_failure_stops_retries(self):
         self.api.call.return_value = (401, {})
-        with self.assertRaises(app.ProvisionError):
+        with self.assertRaises(app.ProvisionError) as caught:
             self.runner.tick()
+        self.assertIn('altare_session', str(caught.exception))
+        self.assertEqual(self.runner.state['paused'], 'http_401')
         with self.assertRaises(app.ProvisionError):
             self.runner.tick()
         self.assertEqual(self.api.call.call_count, 1)
@@ -166,6 +168,21 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_missing_config_fails_before_api_call(self):
         with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(app.ProvisionError):
+                app.configuration()
+
+    def test_missing_token_explains_lookup(self):
+        with patch.dict(os.environ, {'ALTARE_TENANT_ID': '00000000-0000-4000-8000-000000000001'}, clear=True):
+            with self.assertRaises(app.ProvisionError) as caught:
+                app.configuration(create=False)
+        message = str(caught.exception)
+        self.assertIn('altare_session', message)
+        self.assertNotIn('altare_selected_tenant_id', message)
+
+    def test_queries_need_only_token_and_tenant(self):
+        env = {'ALTARE_TOKEN': 'test', 'ALTARE_TENANT_ID': '00000000-0000-4000-8000-000000000001'}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(app.configuration(create=False)['eggId'], 0)
             with self.assertRaises(app.ProvisionError):
                 app.configuration()
 

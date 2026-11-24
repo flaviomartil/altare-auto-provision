@@ -41,11 +41,29 @@ def load_env(path):
         os.environ.setdefault(key, value)
 
 
-def configuration():
-    required = ['ALTARE_TOKEN', 'ALTARE_TENANT_ID', 'ALTARE_SSH_PASSWORD', 'ALTARE_EGG_ID']
+LOOKUP_HELP = {
+    'ALTARE_TOKEN': 'In DevTools open Application (Chrome) or Storage (Firefox) > Cookies > '
+                    'https://console.altare.gg and copy the value of "altare_session".',
+    'ALTARE_TENANT_ID': "In the DevTools console run: copy(localStorage.getItem('altare_selected_tenant_id'))\n"
+                        '    Chrome asks you to type "allow pasting" first. This is the team selected in the console.',
+    'ALTARE_EGG_ID': 'Run --list-options and pick a template id.',
+}
+
+
+def lookup_help(keys):
+    lines = ['Sign in at ' + API_BASE + ', then:']
+    lines += [f'  {key}\n    {LOOKUP_HELP[key]}' for key in keys if key in LOOKUP_HELP]
+    return '\n'.join(lines) if len(lines) > 1 else ''
+
+
+def configuration(create=True):
+    required = ['ALTARE_TOKEN', 'ALTARE_TENANT_ID']
+    if create:
+        required += ['ALTARE_SSH_PASSWORD', 'ALTARE_EGG_ID']
     missing = [key for key in required if not os.environ.get(key)]
     if missing:
-        raise ProvisionError('Missing settings: ' + ', '.join(missing))
+        raise ProvisionError('\n\n'.join(filter(None, ['Missing settings: ' + ', '.join(missing),
+                                                       lookup_help(missing)])))
     env = os.environ.get
     try:
         config = {
@@ -53,7 +71,7 @@ def configuration():
             'tenant': str(uuid.UUID(env('ALTARE_TENANT_ID'))),
             'password': env('ALTARE_SSH_PASSWORD'),
             'name': env('ALTARE_SERVER_NAME', 'my-server').strip(),
-            'eggId': int(env('ALTARE_EGG_ID')),
+            'eggId': int(env('ALTARE_EGG_ID') or 0),
             'memoryMb': int(env('ALTARE_MEMORY_MB', '4096')),
             'cpuPercent': int(env('ALTARE_CPU_PERCENT', '100')),
             'diskMb': int(env('ALTARE_DISK_MB', '10240')),
@@ -63,7 +81,7 @@ def configuration():
         }
     except ValueError:
         raise ProvisionError('Invalid tenant UUID or numeric value.') from None
-    if any(config[k] <= 0 for k in SIZE_FIELDS):
+    if create and any(config[k] <= 0 for k in SIZE_FIELDS):
         raise ProvisionError('Template, RAM, CPU and disk must be positive.')
     if config['interval'] < 600:
         raise ProvisionError('Use an interval of at least 600 seconds.')
@@ -269,6 +287,9 @@ class Provisioner:
         self.state['last_http'] = code
         self.state['next_attempt_at'] = max(time.time() + self.config['interval'], self.api.cooldown)
         self.event(event, http=code, attempts=self.state.get('attempts', 0))
+        if code == 401:
+            self.pause('http_401', 'The session has expired or the token is wrong. Update ALTARE_TOKEN, '
+                                   'then run --resume.\n\n' + lookup_help(['ALTARE_TOKEN']))
         if code in FATAL_HTTP:
             self.pause('http_' + str(code), 'Request rejected. Check authentication, configuration and permissions.')
         self.save()
@@ -297,7 +318,7 @@ def main():
     args = parser.parse_args()
     try:
         load_env(args.env_file)
-        config = configuration()
+        config = configuration(create=not (args.check or args.list_options))
         state_dir = config['state_dir']
         state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         if args.status:
