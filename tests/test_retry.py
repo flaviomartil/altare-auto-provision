@@ -311,6 +311,84 @@ class ConfigurationTests(unittest.TestCase):
                 app.configuration()
 
 
+class TokenRenewalTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.temp.name)
+        self.env_file = self.folder / '.env'
+        self.env_file.write_text('ALTARE_TOKEN=expired\n')
+        self.config = {
+            'token': 'expired', 'tenant': TENANT, 'password': 'pw', 'name': 'example-server', 'eggId': 45,
+            'memoryMb': 4096, 'cpuPercent': 100, 'diskMb': 10240, 'location': 'sg-sgp', 'interval': 600,
+            'state_dir': self.folder / 'state', 'webhook': None,
+        }
+        self.api = FakeApi()
+        self.quiet = [redirect_stdout(io.StringIO()), patch('sys.stderr', io.StringIO())]
+        for context in self.quiet:
+            context.__enter__()
+
+    def tearDown(self):
+        for context in reversed(self.quiet):
+            context.__exit__(None, None, None)
+        self.temp.cleanup()
+
+    def test_loop_waits_for_new_token_and_continues(self):
+        self.api.locations_code = self.api.list_code = 401
+        polls = []
+
+        def sleep(seconds):
+            polls.append(seconds)
+            if len(polls) == 2:
+                self.env_file.write_text('ALTARE_TOKEN=fresh\n')
+                self.api.locations_code = self.api.list_code = 200
+                self.api.create = [(201, {'id': 'server'})]
+
+        args = app.argparse.Namespace(command='run', loop=True, env_file=self.env_file)
+        with patch.object(app.time, 'sleep', sleep):
+            self.assertEqual(app.run_locked(args, self.config, self.api), 0)
+        self.assertEqual(self.config['token'], 'fresh')
+        self.assertEqual(polls, [app.TOKEN_POLL_SECONDS] * 2)
+        state = app.json.loads((self.config['state_dir'] / 'state.json').read_text())
+        self.assertTrue(state['completed'])
+
+    def test_loop_accepts_token_fixed_before_start(self):
+        self.api.create = [(201, {'id': 'server'})]
+        runner = app.Provisioner(self.config, self.api)
+        runner.state['paused'] = 'http_401'
+        runner.save()
+        args = app.argparse.Namespace(command='run', loop=True, env_file=self.env_file)
+        with patch.object(app.time, 'sleep', lambda _: self.fail('should not wait')):
+            self.assertEqual(app.run_locked(args, self.config, self.api), 0)
+
+    def test_run_without_loop_stops_on_expired_session(self):
+        self.api.locations_code = 401
+        args = app.argparse.Namespace(command='run', loop=False, env_file=self.env_file)
+        with self.assertRaises(app.ProvisionError):
+            app.run_locked(args, self.config, self.api)
+
+    def test_token_command_writes_and_resumes(self):
+        state_dir = self.config['state_dir']
+        env = {'ALTARE_TOKEN': 'expired', 'ALTARE_TENANT_ID': TENANT, 'ALTARE_SSH_PASSWORD': 'pw', 'ALTARE_EGG_ID': '45',
+               'ALTARE_SERVER_NAME': 'example-server', 'ALTARE_STATE_DIR': str(state_dir)}
+        with patch.dict(os.environ, env, clear=True), patch.object(app, 'check_session', lambda t, _: 200), \
+                patch.object(app.getpass, 'getpass', lambda _: 'fresh'):
+            runner = app.Provisioner(app.configuration(), self.api)
+            runner.state['paused'] = 'http_401'
+            runner.save()
+            app.update_token(self.env_file)
+            self.assertEqual(app.read_env(self.env_file)['ALTARE_TOKEN'], 'fresh')
+            state = app.json.loads((state_dir / 'state.json').read_text())
+            self.assertNotIn('paused', state)
+
+    def test_token_command_rejects_bad_token(self):
+        with patch.dict(os.environ, {'ALTARE_TENANT_ID': TENANT}, clear=True), \
+                patch.object(app, 'check_session', lambda t, _: 401), \
+                patch.object(app.getpass, 'getpass', lambda _: 'bad'):
+            with self.assertRaises(app.ProvisionError):
+                app.update_token(self.env_file)
+        self.assertEqual(app.read_env(self.env_file)['ALTARE_TOKEN'], 'expired')
+
+
 class SetupTests(unittest.TestCase):
     def test_setup_writes_env(self):
         answers = iter([TENANT, '2', '45', '', '', '', 'box', '', ''])

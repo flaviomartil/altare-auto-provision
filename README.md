@@ -33,6 +33,7 @@ Running the program without a command shows the list of commands.
 | --- | --- |
 | `setup` | Ask for all settings and write `.env` |
 | `run` | Make at most one creation attempt; `run --loop` repeats until it succeeds |
+| `token` | Store a new session token after the old one expired |
 | `status` | Show the local state with local times |
 | `options` | List locations and templates; `options --all` includes game and app templates |
 | `resources` | Show used, free, and total team resources |
@@ -56,7 +57,13 @@ Running the program without a command shows the list of commands.
    copy(localStorage.getItem('altare_selected_tenant_id'))
    ```
 
-The session expires after some time. The API then answers with HTTP 401, the program pauses and shows how to copy a new token. Update `ALTARE_TOKEN`, for example with `setup`, and run `resume`.
+The session expires after some time, and Altare offers no way to renew it from outside the browser. The API then answers with HTTP 401 and the routine pauses; with a webhook configured, you receive a `paused` message. Copy the new `altare_session` value and run:
+
+```bash
+python3 altare_retry.py token
+```
+
+`token` checks the new value against the API and writes only `ALTARE_TOKEN` to `.env`. A loop started with `run --loop` keeps running while the session is expired. It reads `.env` once a minute and continues as soon as it finds a token that the API accepts, so editing `.env` by hand works as well. Without a running loop, `token` lifts the pause and the next `run` continues.
 
 This script uses the console API with a browser session, and that contract may change. Team API tokens (`alt_…`) do not work, because Altare does not allow them to create servers. This is an unofficial integration and does not bypass the provider's authentication challenges.
 
@@ -132,7 +139,8 @@ The state directory contains `state.json`, `events.jsonl`, and `run.lock`. These
 - **HTTP 429:** high traffic or rate limiting. The program respects `Retry-After` and the configured interval.
 - **Other HTTP 5xx:** handled like 503.
 - **Timeout or uncertain response:** the program preserves the idempotency key for the next attempt and checks the server list before creating. This protection also depends on how the provider handles idempotency.
-- **HTTP 400, 401, 403, 404, 405, or 409:** retries pause until you review the configuration, session, or permissions.
+- **HTTP 401:** the session has expired, see [Finding the token and team ID](#finding-the-token-and-team-id).
+- **HTTP 400, 403, 404, 405, or 409:** retries pause until you review the configuration or permissions.
 - **Unknown location:** retries pause until `ALTARE_LOCATION` names a slug from `options`.
 - **Existing server name:** retries pause to avoid creating another server. A pending creation can be reconciled using its name and resource fields returned by the API.
 

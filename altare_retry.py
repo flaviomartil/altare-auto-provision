@@ -23,6 +23,7 @@ EGGS_PATH = '/api/core/eggs'
 CREATE_FIELDS = ('name', 'eggId', 'memoryMb', 'cpuPercent', 'diskMb', 'location')
 SIZE_FIELDS = ('eggId', 'memoryMb', 'cpuPercent', 'diskMb')
 FATAL_HTTP = (400, 401, 403, 404, 405, 409)
+TOKEN_POLL_SECONDS = 60
 NOTIFY_EVENTS = ('created', 'paused')
 RESOURCE_ROWS = (('Memory (MB)', 'memoryMb', 'memoryMb'), ('Disk (MB)', 'diskMb', 'diskMb'),
                  ('CPU (%)', 'cpuPercent', 'cpuPercent'), ('Server slots', 'servers', 'serverSlots'))
@@ -42,9 +43,10 @@ class ProvisionError(Exception):
 
 # Configuration
 
-def load_env(path):
+def read_env(path):
+    values = {}
     if not path.exists():
-        return
+        return values
     for line in path.read_text().splitlines():
         words = shlex.split(line, comments=True)
         if words and words[0] == 'export':
@@ -54,6 +56,12 @@ def load_env(path):
         if len(words) != 1 or '=' not in words[0]:
             raise ProvisionError('Invalid line in environment file.')
         key, value = words[0].split('=', 1)
+        values[key] = value
+    return values
+
+
+def load_env(path):
+    for key, value in read_env(path).items():
         os.environ.setdefault(key, value)
 
 
@@ -182,6 +190,11 @@ class Api:
             if name.strip().lower() == 'retry-after':
                 delay = retry_after_seconds(value.strip(), self.config['interval'])
                 self.cooldown = max(self.cooldown, time.time() + max(0, delay))
+
+
+def check_session(token, tenant):
+    code, _ = Api({'token': token, 'interval': 600}).call(tenant_path({'tenant': tenant}, '/resources'))
+    return code
 
 
 def send_webhook(url, entry):
@@ -394,8 +407,8 @@ class Provisioner:
         self.save()
         self.event(event, http=code, attempts=self.state.get('attempts', 0))
         if code == 401:
-            self.pause('http_401', "The session has expired or the token is wrong. Update ALTARE_TOKEN, "
-                                   "then run 'resume'.\n\n" + lookup_help(['ALTARE_TOKEN']))
+            self.pause('http_401', "The session has expired or the token is wrong. Run 'token' to store a "
+                                   "new one. A running loop continues on its own.\n\n" + lookup_help(['ALTARE_TOKEN']))
         if code in FATAL_HTTP:
             self.pause('http_' + str(code), 'Request rejected. Check authentication, configuration and permissions.')
         return 'wait'
@@ -501,6 +514,59 @@ def setup(env_file):
     print('Restart a loop that is already running so it picks up the new settings.')
 
 
+def update_token(env_file):
+    tenant = os.environ.get('ALTARE_TENANT_ID', '')
+    if not tenant or valid_uuid(tenant):
+        raise ProvisionError("ALTARE_TENANT_ID is missing. Run 'setup' instead.")
+    print(LOOKUP_HELP['ALTARE_TOKEN'])
+    token = prompt('ALTARE_TOKEN', secret=True)
+    code = check_session(token, tenant)
+    if code != 200:
+        raise ProvisionError(f'The token was rejected (HTTP {code}). Nothing written.')
+    write_env(env_file, {'ALTARE_TOKEN': token})
+    os.environ['ALTARE_TOKEN'] = token
+    print(f'Saved to {env_file}.')
+    try:
+        config = configuration()
+    except ProvisionError:
+        return
+    lock = try_lock(config)
+    if lock is None:
+        print(f'The running loop picks up the new token within {TOKEN_POLL_SECONDS} seconds.')
+        return
+    with lock:
+        runner = Provisioner(config, Api(config))
+        if runner.state.get('paused') == 'http_401':
+            runner.resume()
+            print("Start the loop again with 'run --loop'.")
+
+
+def wait_for_new_token(env_file, config, runner):
+    """Keep a paused loop alive until .env holds a token that the API accepts."""
+    rejected = None
+    token = config['token']
+    while True:
+        if not token or token == rejected:
+            time.sleep(TOKEN_POLL_SECONDS)
+            token = read_env(env_file).get('ALTARE_TOKEN', '')
+            continue
+        config['token'] = token
+        code, _ = runner.api.items(runner.servers)
+        if code == 200:
+            runner.resume()
+            return
+        if code in (401, 403):
+            if rejected is None:
+                print(f'Waiting for a new ALTARE_TOKEN in {env_file}.', flush=True)
+            else:
+                print(f'The new token was rejected (HTTP {code}).', flush=True)
+            rejected = token
+        else:
+            # A network error or similar: check again after the next poll.
+            time.sleep(TOKEN_POLL_SECONDS)
+            token = read_env(env_file).get('ALTARE_TOKEN', '') or token
+
+
 # Command line
 
 def build_parser():
@@ -513,6 +579,7 @@ def build_parser():
     commands.add_parser('setup', parents=[common], help='Ask for the settings and write the .env file.')
     run = commands.add_parser('run', parents=[common], help='Try to create the server once, or until it works.')
     run.add_argument('--loop', action='store_true', help='Repeat every interval until the server is created.')
+    commands.add_parser('token', parents=[common], help='Store a new session token after it expired.')
     commands.add_parser('status', parents=[common], help='Show the local state.')
     options = commands.add_parser('options', parents=[common], help='List locations and templates.')
     options.add_argument('--all', action='store_true', help='Include game and app templates.')
@@ -522,20 +589,40 @@ def build_parser():
     return parser
 
 
+def try_lock(config):
+    """Return the open lock file, or None while another run holds it."""
+    config['state_dir'].mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = (config['state_dir'] / 'run.lock').open('a')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return None
+    return lock
+
+
 def run_locked(args, config, api):
-    with (config['state_dir'] / 'run.lock').open('a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print('Another run is already active. Stop it first.')
-            return 0
+    lock = try_lock(config)
+    if lock is None:
+        print('Another run is already active. Stop it first.')
+        return 0
+    with lock:
         runner = Provisioner(config, api)
         if args.command == 'resume':
             runner.resume()
         elif args.command == 'reset':
             runner.reset()
         else:
-            while runner.tick() != 'done' and args.loop:
+            while True:
+                try:
+                    if runner.tick() == 'done' or not args.loop:
+                        break
+                except ProvisionError as error:
+                    if not (args.loop and runner.state.get('paused') == 'http_401'):
+                        raise
+                    print(str(error).split('\n\n')[0], file=sys.stderr, flush=True)
+                    wait_for_new_token(args.env_file, config, runner)
+                    continue
                 time.sleep(max(config['interval'], runner.state.get('next_attempt_at', 0) - time.time()))
         return 0
 
@@ -551,6 +638,9 @@ def main(argv=None):
         load_env(args.env_file)
         if args.command == 'setup':
             setup(args.env_file)
+            return 0
+        if args.command == 'token':
+            update_token(args.env_file)
             return 0
         config = configuration(create=args.command in ('run', 'resume', 'reset'))
         api = Api(config)
@@ -572,7 +662,6 @@ def main(argv=None):
                 raise ProvisionError('Query failed. HTTP ' + str(code))
             print('\n'.join(resource_table(data)))
         else:
-            config['state_dir'].mkdir(parents=True, exist_ok=True, mode=0o700)
             return run_locked(args, config, api)
         return 0
     except ProvisionError as error:
