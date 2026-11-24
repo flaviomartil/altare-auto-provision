@@ -1,5 +1,6 @@
 import argparse
 import datetime
+from email.utils import parsedate_to_datetime
 import fcntl
 import hashlib
 import json
@@ -13,6 +14,12 @@ import tempfile
 import time
 from urllib.parse import quote
 import uuid
+
+
+API_BASE = 'https://console.altare.gg'
+CREATE_FIELDS = ('name', 'eggId', 'memoryMb', 'cpuPercent', 'diskMb', 'location')
+SIZE_FIELDS = ('eggId', 'memoryMb', 'cpuPercent', 'diskMb')
+FATAL_HTTP = (400, 401, 403, 404, 405, 409)
 
 
 class ProvisionError(Exception):
@@ -29,40 +36,57 @@ def load_env(path):
         if not words:
             continue
         if len(words) != 1 or '=' not in words[0]:
-            raise ProvisionError('Formato inválido no arquivo de ambiente.')
+            raise ProvisionError('Invalid line in environment file.')
         key, value = words[0].split('=', 1)
         os.environ.setdefault(key, value)
 
 
 def configuration():
     required = ['ALTARE_TOKEN', 'ALTARE_TENANT_ID', 'ALTARE_SSH_PASSWORD', 'ALTARE_EGG_ID']
-    if any(not os.environ.get(key) for key in required):
-        raise ProvisionError('Preencha: ' + ', '.join(required))
+    missing = [key for key in required if not os.environ.get(key)]
+    if missing:
+        raise ProvisionError('Missing settings: ' + ', '.join(missing))
+    env = os.environ.get
     try:
         config = {
-            'token': os.environ['ALTARE_TOKEN'],
-            'tenant': str(uuid.UUID(os.environ['ALTARE_TENANT_ID'])),
-            'password': os.environ['ALTARE_SSH_PASSWORD'],
-            'name': os.environ.get('ALTARE_SERVER_NAME', 'my-server'),
-            'eggId': int(os.environ['ALTARE_EGG_ID']),
-            'memoryMb': int(os.environ.get('ALTARE_MEMORY_MB', '4096')),
-            'cpuPercent': int(os.environ.get('ALTARE_CPU_PERCENT', '100')),
-            'diskMb': int(os.environ.get('ALTARE_DISK_MB', '10240')),
-            'location': os.environ.get('ALTARE_LOCATION', 'sg-sgp'),
-            'interval': int(os.environ.get('ALTARE_INTERVAL_SECONDS', '600')),
-            'state_dir': Path(os.environ.get('ALTARE_STATE_DIR', '.state')).expanduser().resolve(),
+            'token': env('ALTARE_TOKEN'),
+            'tenant': str(uuid.UUID(env('ALTARE_TENANT_ID'))),
+            'password': env('ALTARE_SSH_PASSWORD'),
+            'name': env('ALTARE_SERVER_NAME', 'my-server').strip(),
+            'eggId': int(env('ALTARE_EGG_ID')),
+            'memoryMb': int(env('ALTARE_MEMORY_MB', '4096')),
+            'cpuPercent': int(env('ALTARE_CPU_PERCENT', '100')),
+            'diskMb': int(env('ALTARE_DISK_MB', '10240')),
+            'location': env('ALTARE_LOCATION', 'sg-sgp').strip(),
+            'interval': int(env('ALTARE_INTERVAL_SECONDS', '600')),
+            'state_dir': Path(env('ALTARE_STATE_DIR', '.state')).expanduser().resolve(),
         }
-    except (ValueError, KeyError):
-        raise ProvisionError('UUID ou valor numérico inválido.') from None
-    if any(config[k] <= 0 for k in ['eggId', 'memoryMb', 'cpuPercent', 'diskMb']):
-        raise ProvisionError('Template, RAM, CPU e disco precisam ser positivos.')
+    except ValueError:
+        raise ProvisionError('Invalid tenant UUID or numeric value.') from None
+    if any(config[k] <= 0 for k in SIZE_FIELDS):
+        raise ProvisionError('Template, RAM, CPU and disk must be positive.')
     if config['interval'] < 600:
-        raise ProvisionError('Use um intervalo de pelo menos 600 segundos.')
-    if not config['name'].strip() or not config['location'].strip():
-        raise ProvisionError('Nome e região são obrigatórios.')
+        raise ProvisionError('Use an interval of at least 600 seconds.')
+    if not config['name'] or not config['location']:
+        raise ProvisionError('Server name and location are required.')
     if not shutil.which('curl'):
-        raise ProvisionError('Instale curl antes de continuar.')
+        raise ProvisionError('Install curl before continuing.')
     return config
+
+
+def tenant_path(config, suffix):
+    return '/api/tenants/' + quote(config['tenant'], safe='') + suffix
+
+
+def retry_after_seconds(value, fallback):
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return int(parsedate_to_datetime(value).timestamp() - time.time())
+    except (ValueError, TypeError, OverflowError):
+        return fallback
 
 
 class Api:
@@ -71,11 +95,12 @@ class Api:
         self.cooldown = 0
 
     def call(self, path, body=None, key=None):
+        # Options go through stdin so the token never shows up in the process list.
         headers = {'Authorization': 'Bearer ' + self.config['token'], 'Content-Type': 'application/json'}
         if key:
             headers['Idempotency-Key'] = key
-        lines = ['url = ' + json.dumps('https://console.altare.gg' + path)]
-        lines.extend('header = ' + json.dumps(k + ': ' + v) for k, v in headers.items())
+        lines = ['url = ' + json.dumps(API_BASE + path)]
+        lines += ['header = ' + json.dumps(k + ': ' + v) for k, v in headers.items()]
         if body is not None:
             lines.append('data = ' + json.dumps(json.dumps(body)))
         with tempfile.TemporaryDirectory() as directory:
@@ -89,26 +114,21 @@ class Api:
                 )
             except subprocess.TimeoutExpired:
                 return 0, {}
-            for line in header_file.read_text().splitlines() if header_file.exists() else []:
-                if line.lower().startswith('retry-after:'):
-                    value = line.split(':', 1)[1].strip()
-                    try:
-                        delay = int(value)
-                    except ValueError:
-                        from email.utils import parsedate_to_datetime
-                        try:
-                            delay = int(parsedate_to_datetime(value).timestamp() - time.time())
-                        except (ValueError, TypeError, OverflowError):
-                            delay = self.config['interval']
-                    self.cooldown = max(self.cooldown, time.time() + max(0, delay))
+            if header_file.exists():
+                self._note_retry_after(header_file.read_text())
         raw, _, code = result.stdout.rpartition('\nHTTP:')
         try:
             data = json.loads(raw)
-            if not isinstance(data, dict):
-                data = {}
         except ValueError:
-            data = {}
-        return int(code or 0), data
+            data = None
+        return (int(code) if code.strip().isdigit() else 0), (data if isinstance(data, dict) else {})
+
+    def _note_retry_after(self, headers):
+        for line in headers.splitlines():
+            name, _, value = line.partition(':')
+            if name.strip().lower() == 'retry-after':
+                delay = retry_after_seconds(value.strip(), self.config['interval'])
+                self.cooldown = max(self.cooldown, time.time() + max(0, delay))
 
 
 class Provisioner:
@@ -119,60 +139,64 @@ class Provisioner:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = self.directory / 'state.json'
         self.state = json.loads(self.path.read_text()) if self.path.exists() else {}
-        target = {k: config[k] for k in ['tenant', 'name', 'eggId', 'location', 'memoryMb', 'cpuPercent', 'diskMb']}
+        target = {k: config[k] for k in ('tenant',) + CREATE_FIELDS}
         fingerprint = hashlib.sha256(json.dumps(target, sort_keys=True).encode()).hexdigest()
-        if self.state.get('target', fingerprint) != fingerprint:
-            raise ProvisionError('A configuração mudou. Use outro ALTARE_STATE_DIR para outro servidor.')
-        self.state['target'] = fingerprint
-        self.servers = '/api/tenants/' + quote(config['tenant'], safe='') + '/servers'
+        if self.state.setdefault('target', fingerprint) != fingerprint:
+            raise ProvisionError('Configuration changed. Use a different ALTARE_STATE_DIR for another server.')
+        self.servers = tenant_path(config, '/servers')
 
     def save(self):
         temp = self.path.with_suffix('.tmp')
-        with temp.open('w') as handle:
-            json.dump(self.state, handle, indent=2)
+        temp.write_text(json.dumps(self.state, indent=2))
         temp.chmod(0o600)
         temp.replace(self.path)
 
     def event(self, name, **values):
         entry = {'at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'event': name, **values}
+        line = json.dumps(entry)
         with (self.directory / 'events.jsonl').open('a') as handle:
-            handle.write(json.dumps(entry) + '\n')
-        print(json.dumps(entry), flush=True)
+            handle.write(line + '\n')
+        print(line, flush=True)
+
+    def pause(self, reason, message):
+        self.state['paused'] = reason
+        self.save()
+        raise ProvisionError(message)
+
+    def named(self, listing):
+        return [s for s in listing.get('items') or [] if s.get('name') == self.config['name']]
 
     def complete(self, server):
-        self.state['server_id'] = server['id']
-        self.state['completed'] = True
+        self.state.update(server_id=server['id'], completed=True)
         self.state.pop('pending_key', None)
         self.save()
-        self.event('created', panel='https://console.altare.gg/server/' + str(server['id']))
+        self.event('created', panel=API_BASE + '/server/' + str(server['id']))
         return 'done'
 
     def tick(self):
         if self.state.get('completed'):
             return 'done'
         if self.state.get('paused'):
-            raise ProvisionError('Rotina pausada. Consulte --status e o README antes de retomar.')
+            raise ProvisionError('Routine is paused. Check --status and the README before resuming.')
         if time.time() < self.state.get('next_attempt_at', 0):
             return 'wait'
+
         code, listing = self.api.call(self.servers)
         if code != 200 or not isinstance(listing.get('items'), list):
             return self.failure(code, 'list_failed')
-        matches = [s for s in listing['items'] if s.get('name') == self.config['name']]
+        matches = self.named(listing)
         if matches:
-            if self.state.get('pending_key') and len(matches) == 1:
-                server = matches[0]
-                fields = ['memoryMb', 'cpuPercent', 'diskMb', 'eggId']
-                if all(server.get(k) == self.config[k] for k in fields):
-                    return self.complete(server)
-            self.state['paused'] = 'name_already_exists'
-            self.save()
-            raise ProvisionError('Já existe um servidor com esse nome. Confira o painel antes de continuar.')
-        if not self.state.get('pending_key'):
-            self.state['pending_key'] = str(uuid.uuid4())
+            # A previous attempt may have created the server even though the response was lost.
+            if self.state.get('pending_key') and len(matches) == 1 and \
+                    all(matches[0].get(k) == self.config[k] for k in SIZE_FIELDS):
+                return self.complete(matches[0])
+            self.pause('name_already_exists', 'A server with this name already exists. Check the panel first.')
+
+        self.state.setdefault('pending_key', str(uuid.uuid4()))
         self.state['attempts'] = self.state.get('attempts', 0) + 1
         self.state['next_attempt_at'] = time.time() + self.config['interval']
         self.save()
-        payload = {k: self.config[k] for k in ['name', 'eggId', 'memoryMb', 'cpuPercent', 'diskMb', 'location']}
+        payload = {k: self.config[k] for k in CREATE_FIELDS}
         payload['ssh'] = {'password': self.config['password']}
         code, response = self.api.call(self.servers, payload, self.state['pending_key'])
         if 200 <= code < 300 and response.get('id'):
@@ -180,68 +204,71 @@ class Provisioner:
         if code in (422, 429):
             self.state.pop('pending_key', None)
         elif code >= 500:
+            # Only drop the key when the server definitely was not created.
             check_code, check = self.api.call(self.servers)
-            if check_code == 200 and check.get('items') == []:
+            if check_code == 200 and isinstance(check.get('items'), list) and not self.named(check):
                 self.state.pop('pending_key', None)
         return self.failure(code, 'creation_failed')
 
     def failure(self, code, event):
         self.state['last_http'] = code
         self.state['next_attempt_at'] = max(time.time() + self.config['interval'], self.api.cooldown)
-        if code in (400, 401, 403, 404, 405, 409):
-            self.state['paused'] = 'http_' + str(code)
-        self.save()
         self.event(event, http=code, attempts=self.state.get('attempts', 0))
-        if self.state.get('paused'):
-            raise ProvisionError('Requisição recusada. Confira autenticação, configuração e permissões.')
+        if code in FATAL_HTTP:
+            self.pause('http_' + str(code), 'Request rejected. Check authentication, configuration and permissions.')
+        self.save()
         return 'wait'
+
+
+def query(api, paths):
+    for path in paths:
+        code, data = api.call(path)
+        if code != 200:
+            raise ProvisionError('Query failed. HTTP ' + str(code))
+        print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def main():
     os.umask(0o077)
-    parser = argparse.ArgumentParser(description='Tenta criar um servidor Altare até haver disponibilidade.')
+    parser = argparse.ArgumentParser(description='Retries creating an Altare server until capacity is available.')
     parser.add_argument('--env-file', type=Path, default=Path('.env'))
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument('--loop', action='store_true', help='Repete a cada intervalo até criar.')
-    mode.add_argument('--status', action='store_true', help='Mostra somente o estado local.')
-    mode.add_argument('--check', action='store_true', help='Consulta recursos, sem criar servidor.')
-    mode.add_argument('--list-options', action='store_true', help='Lista regiões e templates, sem criar.')
+    mode.add_argument('--loop', action='store_true', help='Repeat every interval until the server is created.')
+    mode.add_argument('--status', action='store_true', help='Show the local state only.')
+    mode.add_argument('--check', action='store_true', help='Query tenant resources without creating a server.')
+    mode.add_argument('--list-options', action='store_true', help='List locations and templates without creating.')
     args = parser.parse_args()
     try:
         load_env(args.env_file)
         config = configuration()
-        config['state_dir'].mkdir(parents=True, exist_ok=True, mode=0o700)
+        state_dir = config['state_dir']
+        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         if args.status:
-            state_file = config['state_dir'] / 'state.json'
+            state_file = state_dir / 'state.json'
             print(json.dumps(json.loads(state_file.read_text()) if state_file.exists() else {}, indent=2))
             return 0
-        with (config['state_dir'] / 'run.lock').open('a') as lock:
+        with (state_dir / 'run.lock').open('a') as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                print('Outra execução já está ativa.')
+                print('Another run is already active.')
                 return 0
             api = Api(config)
-            runner = Provisioner(config, api)
-            if args.check or args.list_options:
-                paths = ['/api/core/locations', '/api/core/eggs'] if args.list_options else [
-                    '/api/tenants/' + config['tenant'] + '/resources']
-                for path in paths:
-                    code, data = api.call(path)
-                    if code != 200:
-                        raise ProvisionError('Falha na consulta. HTTP ' + str(code))
-                    print(json.dumps(data, indent=2, ensure_ascii=False))
+            if args.list_options:
+                query(api, ['/api/core/locations', '/api/core/eggs'])
                 return 0
-            while True:
-                outcome = runner.tick()
-                if outcome == 'done' or not args.loop:
-                    return 0
+            if args.check:
+                query(api, [tenant_path(config, '/resources')])
+                return 0
+            runner = Provisioner(config, api)
+            while runner.tick() != 'done' and args.loop:
                 time.sleep(max(config['interval'], runner.state.get('next_attempt_at', 0) - time.time()))
+            return 0
     except ProvisionError as error:
         print(str(error), file=sys.stderr)
         return 2
     except (OSError, ValueError):
-        print('Erro de configuração, autenticação ou estado. Confira o .env, --status e o README.', file=sys.stderr)
+        print('Configuration, authentication or state error. Check .env, --status and the README.', file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         return 130

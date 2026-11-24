@@ -87,6 +87,22 @@ class ProvisionTests(unittest.TestCase):
         self.assertNotIn('pending_key', self.runner.state)
         self.assertEqual(self.api.call.call_count, 3)
 
+    def test_server_failure_ignores_unrelated_servers(self):
+        other = {'items': [{'name': 'other-server', 'id': 'x'}]}
+        self.api.call.side_effect = [(200, other), (500, {}), (200, other)]
+        self.runner.tick()
+        self.assertNotIn('pending_key', self.runner.state)
+
+    def test_server_failure_keeps_key_when_server_appears(self):
+        created = {'items': [{'name': 'example-server', 'id': 'x'}]}
+        self.api.call.side_effect = [(200, {'items': []}), (500, {}), (200, created)]
+        self.runner.tick()
+        self.assertIn('pending_key', self.runner.state)
+
+    def test_retry_after_parsing(self):
+        self.assertEqual(app.retry_after_seconds('120', 600), 120)
+        self.assertEqual(app.retry_after_seconds('garbage', 600), 600)
+
     def test_rate_limit_honors_server_cooldown(self):
         self.api.cooldown = app.time.time() + 7200
         self.api.call.side_effect = [(200, {'items': []}), (429, {})]
