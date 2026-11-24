@@ -76,28 +76,62 @@ class ProvisionTests(unittest.TestCase):
             self.runner.tick()
         self.assertEqual(self.api.call.call_count, 1)
 
-    def test_changed_target_refused(self):
+    def test_changed_target_starts_fresh(self):
+        self.runner.state.update(attempts=3, pending_key='old')
         self.runner.save()
-        with self.assertRaises(app.ProvisionError):
-            app.Provisioner({**self.config, 'location': 'other-region'}, self.api)
+        loaded = app.Provisioner({**self.config, 'location': 'other-region'}, self.api)
+        self.assertNotIn('pending_key', loaded.state)
+        self.assertNotIn('attempts', loaded.state)
+        self.assertIn('warning', (self.config['state_dir'] / 'events.jsonl').read_text())
 
-    def test_server_failure_checks_for_creation(self):
-        self.api.call.side_effect = [(200, {'items': []}), (500, {}), (200, {'items': []})]
+    def test_server_failure_needs_no_extra_request(self):
+        self.api.call.side_effect = [(200, {'items': []}), (503, {})]
         self.runner.tick()
-        self.assertNotIn('pending_key', self.runner.state)
-        self.assertEqual(self.api.call.call_count, 3)
-
-    def test_server_failure_ignores_unrelated_servers(self):
-        other = {'items': [{'name': 'other-server', 'id': 'x'}]}
-        self.api.call.side_effect = [(200, other), (500, {}), (200, other)]
-        self.runner.tick()
-        self.assertNotIn('pending_key', self.runner.state)
-
-    def test_server_failure_keeps_key_when_server_appears(self):
-        created = {'items': [{'name': 'example-server', 'id': 'x'}]}
-        self.api.call.side_effect = [(200, {'items': []}), (500, {}), (200, created)]
-        self.runner.tick()
+        self.assertEqual(self.api.call.call_count, 2)
         self.assertIn('pending_key', self.runner.state)
+
+    def test_server_failure_rotates_key_when_nothing_created(self):
+        other = {'items': [{'name': 'other-server', 'id': 'x'}]}
+        self.api.call.side_effect = [(200, other), (503, {})]
+        self.runner.tick()
+        old = self.runner.state['pending_key']
+        self.runner.state['next_attempt_at'] = 0
+        self.api.call.side_effect = [(200, other), (503, {})]
+        self.runner.tick()
+        self.assertNotEqual(self.api.call.call_args.args[2], old)
+
+    def test_server_failure_reconciles_created_server(self):
+        server = {k: self.config[k] for k in ['name', 'memoryMb', 'cpuPercent', 'diskMb', 'eggId']}
+        server['id'] = 'late-server'
+        self.api.call.side_effect = [(200, {'items': []}), (503, {})]
+        self.runner.tick()
+        self.runner.state['next_attempt_at'] = 0
+        self.api.call.side_effect = [(200, {'items': [server]})]
+        self.assertEqual(self.runner.tick(), 'done')
+        self.assertEqual(self.runner.state['server_id'], 'late-server')
+
+    def test_resume_lifts_pause(self):
+        self.api.call.return_value = (401, {})
+        with self.assertRaises(app.ProvisionError):
+            self.runner.tick()
+        self.runner.resume()
+        self.assertNotIn('paused', self.runner.state)
+        self.api.call.side_effect = [(200, {'items': []}), (201, {'id': 'server'})]
+        self.assertEqual(self.runner.tick(), 'done')
+
+    def test_reset_starts_over_after_completion(self):
+        self.runner.state.update(completed=True, server_id='old', attempts=4)
+        self.runner.reset()
+        self.assertEqual(self.runner.state, {'target': self.runner.fingerprint})
+
+    def test_status_is_readable(self):
+        now = 1_800_000_000
+        lines = app.status_lines({'attempts': 7, 'last_http': 503, 'next_attempt_at': now + 300}, now)
+        text = '\n'.join(lines)
+        self.assertIn('waiting for capacity', text)
+        self.assertIn('(in 5 min)', text)
+        self.assertNotIn(str(now + 300), text)
+        self.assertIn('not started', app.status_lines({})[0])
 
     def test_retry_after_parsing(self):
         self.assertEqual(app.retry_after_seconds('120', 600), 120)

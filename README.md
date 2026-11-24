@@ -126,20 +126,31 @@ python3 altare_retry.py --env-file /path/to/config.env --loop
 python3 altare_retry.py --status
 ```
 
+This prints the current phase, the number of attempts, the last HTTP status and the time of the next attempt in local time.
+
 The state directory contains `state.json`, `events.jsonl`, and `run.lock`. These files do not store the token or SSH password. Preserve them when restarting. The execution lock prevents concurrent runs sharing the same state directory. Use one machine and one state directory for each request.
 
+- **HTTP 503:** Altare usually answers this way when no capacity is free. The program keeps the idempotency key and checks the server list at the start of the next attempt. If no server with the configured name exists, it continues with a new key.
 - **HTTP 422:** capacity is unavailable or the resource combination was rejected. The program retries after the interval. If this persists, check your quotas, template, and region.
 - **HTTP 429:** high traffic or rate limiting. The program respects `Retry-After` and the configured interval.
-- **HTTP 5xx:** provider failure. The program checks the server list to reconcile the result before the next attempt.
+- **Other HTTP 5xx:** handled like 503.
 - **Timeout or uncertain response:** the program preserves the idempotency key for the next attempt and checks the server list before creating. This protection also depends on how the provider handles idempotency.
 - **HTTP 400, 401, 403, 404, 405, or 409:** retries pause until you review the configuration, session, or permissions.
 - **Existing server name:** retries pause to avoid creating another server. A pending creation can be reconciled using its name and resource fields returned by the API.
 
 Logs contain events and HTTP status codes. API error bodies, authentication headers, and passwords are not printed. The completed state stores the server ID. Later runs do not create another server, even if you subsequently delete it in the console.
 
-To resume a paused request, first check the console and fix the cause. With the process stopped, remove only the `paused` field from `state.json`. Preserve `pending_key` if present. Do not delete state after an uncertain response without checking whether the server was created.
+To resume a paused request, first check the console and fix the cause, then stop any running process and run:
 
-To create another server, use a different name and `ALTARE_STATE_DIR`. Changing the region, template, or resource settings of an existing request requires a new state directory. Resolve any pending attempt for the previous configuration first.
+```bash
+python3 altare_retry.py --resume
+```
+
+This lifts the pause and keeps an unconfirmed attempt, so the next run first checks whether that attempt created the server.
+
+To start over, for example after deleting the created server in the console, run `--reset`. It discards the local state. Changing the name, region, template, or resource settings has the same effect on the next run. In both cases the program logs a warning if the last attempt was unconfirmed. A server with the same name still pauses the routine instead of creating a duplicate, but a server created under a previous name is not detected. Check the console in that case.
+
+To run several requests side by side, give each one its own name and `ALTARE_STATE_DIR`.
 
 ## Credentials and scope
 

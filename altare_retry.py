@@ -89,6 +89,41 @@ def retry_after_seconds(value, fallback):
         return fallback
 
 
+def local_time(timestamp):
+    return datetime.datetime.fromtimestamp(timestamp).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
+
+
+def duration(seconds):
+    minutes = round(seconds / 60)
+    return f'{minutes} min' if minutes < 120 else f'{minutes / 60:.1f} h'
+
+
+def status_lines(state, now=None):
+    now = time.time() if now is None else now
+    if not state:
+        phase = 'not started'
+    elif state.get('completed'):
+        phase = 'completed'
+    elif state.get('paused'):
+        phase = 'paused (' + state['paused'] + '), run --resume after fixing the cause'
+    else:
+        phase = 'waiting for capacity'
+    rows = [('Status', phase)]
+    if 'server_id' in state:
+        rows.append(('Server', API_BASE + '/server/' + str(state['server_id'])))
+    rows.append(('Attempts', str(state.get('attempts', 0))))
+    if 'last_http' in state:
+        rows.append(('Last HTTP', str(state['last_http'])))
+    due = state.get('next_attempt_at')
+    if due and not state.get('completed') and not state.get('paused'):
+        when = 'in ' + duration(due - now) if due > now else 'now'
+        rows.append(('Next attempt', f'{local_time(due)} ({when})'))
+    if state.get('pending_key'):
+        rows.append(('Unconfirmed', 'the last attempt may have created the server, the next run checks'))
+    width = max(len(label) for label, _ in rows) + 1
+    return [f'{label + ":":<{width}} {value}' for label, value in rows]
+
+
 class Api:
     def __init__(self, config):
         self.config = config
@@ -138,12 +173,12 @@ class Provisioner:
         self.directory = config['state_dir']
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = self.directory / 'state.json'
-        self.state = json.loads(self.path.read_text()) if self.path.exists() else {}
-        target = {k: config[k] for k in ('tenant',) + CREATE_FIELDS}
-        fingerprint = hashlib.sha256(json.dumps(target, sort_keys=True).encode()).hexdigest()
-        if self.state.setdefault('target', fingerprint) != fingerprint:
-            raise ProvisionError('Configuration changed. Use a different ALTARE_STATE_DIR for another server.')
         self.servers = tenant_path(config, '/servers')
+        target = {k: config[k] for k in ('tenant',) + CREATE_FIELDS}
+        self.fingerprint = hashlib.sha256(json.dumps(target, sort_keys=True).encode()).hexdigest()
+        self.state = json.loads(self.path.read_text()) if self.path.exists() else {}
+        if self.state.setdefault('target', self.fingerprint) != self.fingerprint:
+            self.reset('config_changed')
 
     def save(self):
         temp = self.path.with_suffix('.tmp')
@@ -166,23 +201,42 @@ class Provisioner:
     def named(self, listing):
         return [s for s in listing.get('items') or [] if s.get('name') == self.config['name']]
 
+    def list_servers(self):
+        code, listing = self.api.call(self.servers)
+        ok = code == 200 and isinstance(listing.get('items'), list)
+        return code, (listing if ok else None)
+
     def complete(self, server):
         self.state.update(server_id=server['id'], completed=True)
-        self.state.pop('pending_key', None)
+        for key in ('pending_key', 'retire_key', 'paused'):
+            self.state.pop(key, None)
         self.save()
         self.event('created', panel=API_BASE + '/server/' + str(server['id']))
         return 'done'
+
+    def resume(self):
+        if self.state.pop('paused', None):
+            self.state['next_attempt_at'] = 0
+            self.save()
+            self.event('resumed')
+
+    def reset(self, reason='reset'):
+        # Safe without an API call: tick() pauses instead of creating a second server with the same name.
+        unconfirmed = bool(self.state.get('pending_key'))
+        self.state = {'target': self.fingerprint}
+        self.save()
+        self.event(reason, **({'warning': 'last attempt was unconfirmed, check the panel'} if unconfirmed else {}))
 
     def tick(self):
         if self.state.get('completed'):
             return 'done'
         if self.state.get('paused'):
-            raise ProvisionError('Routine is paused. Check --status and the README before resuming.')
+            raise ProvisionError('Routine is paused. Check --status, then run --resume.')
         if time.time() < self.state.get('next_attempt_at', 0):
             return 'wait'
 
-        code, listing = self.api.call(self.servers)
-        if code != 200 or not isinstance(listing.get('items'), list):
+        code, listing = self.list_servers()
+        if listing is None:
             return self.failure(code, 'list_failed')
         matches = self.named(listing)
         if matches:
@@ -191,6 +245,9 @@ class Provisioner:
                     all(matches[0].get(k) == self.config[k] for k in SIZE_FIELDS):
                 return self.complete(matches[0])
             self.pause('name_already_exists', 'A server with this name already exists. Check the panel first.')
+        if self.state.pop('retire_key', False):
+            # The last attempt failed on the provider side and the listing shows no server.
+            self.state.pop('pending_key', None)
 
         self.state.setdefault('pending_key', str(uuid.uuid4()))
         self.state['attempts'] = self.state.get('attempts', 0) + 1
@@ -204,10 +261,8 @@ class Provisioner:
         if code in (422, 429):
             self.state.pop('pending_key', None)
         elif code >= 500:
-            # Only drop the key when the server definitely was not created.
-            check_code, check = self.api.call(self.servers)
-            if check_code == 200 and isinstance(check.get('items'), list) and not self.named(check):
-                self.state.pop('pending_key', None)
+            # Keep the key until the next listing confirms that nothing was created.
+            self.state['retire_key'] = True
         return self.failure(code, 'creation_failed')
 
     def failure(self, code, event):
@@ -237,6 +292,8 @@ def main():
     mode.add_argument('--status', action='store_true', help='Show the local state only.')
     mode.add_argument('--check', action='store_true', help='Query tenant resources without creating a server.')
     mode.add_argument('--list-options', action='store_true', help='List locations and templates without creating.')
+    mode.add_argument('--resume', action='store_true', help='Lift a pause and retry on the next run.')
+    mode.add_argument('--reset', action='store_true', help='Discard the local state and start over.')
     args = parser.parse_args()
     try:
         load_env(args.env_file)
@@ -245,13 +302,13 @@ def main():
         state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         if args.status:
             state_file = state_dir / 'state.json'
-            print(json.dumps(json.loads(state_file.read_text()) if state_file.exists() else {}, indent=2))
+            print('\n'.join(status_lines(json.loads(state_file.read_text()) if state_file.exists() else {})))
             return 0
         with (state_dir / 'run.lock').open('a') as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                print('Another run is already active.')
+                print('Another run is already active. Stop it first.')
                 return 0
             api = Api(config)
             if args.list_options:
@@ -261,6 +318,12 @@ def main():
                 query(api, [tenant_path(config, '/resources')])
                 return 0
             runner = Provisioner(config, api)
+            if args.resume:
+                runner.resume()
+                return 0
+            if args.reset:
+                runner.reset()
+                return 0
             while runner.tick() != 'done' and args.loop:
                 time.sleep(max(config['interval'], runner.state.get('next_attempt_at', 0) - time.time()))
             return 0
