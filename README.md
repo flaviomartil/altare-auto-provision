@@ -21,7 +21,7 @@ No Python packages are required. Windows users can use WSL; native Windows is no
 ## Quick start
 
 ```bash
-git clone https://github.com/flaviomartil/altare-auto-provision.git
+git clone https://github.com/Knyllahsyhn/altare-auto-provision.git
 cd altare-auto-provision
 cp .env.example .env
 chmod 600 .env
